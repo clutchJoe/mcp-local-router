@@ -688,6 +688,7 @@ dependencies = [
  "mcp-client",
  "mcp-core",
  "mcp-server",
+ "mcp-spec",
  "serde_json",
  "tokio",
  "tracing-subscriber",

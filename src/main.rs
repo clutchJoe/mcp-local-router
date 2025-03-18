@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use mcp_client::{
@@ -22,20 +22,21 @@ use mcp_client::{
     service::McpService,
     transport::{SseTransport, StdioTransport, Transport},
 };
-use mcp_core::{
+use mcp_spec::{
     content::Content,
     handler::{PromptError, ResourceError, ToolError},
     prompt::Prompt,
     protocol::{
-        CallToolResult, GetPromptResult, Implementation, InitializeResult, JsonRpcRequest,
-        JsonRpcResponse, ListPromptsResult, ListResourcesResult, ListToolsResult, PromptsCapability,
-        ReadResourceResult, ResourcesCapability, ServerCapabilities, ToolsCapability,
+        PromptsCapability,
+        ResourcesCapability,
+        ServerCapabilities,
+        ToolsCapability,
     },
     resource::Resource,
-    ResourceContents, Role, Tool,
+    tool::Tool,
 };
 use mcp_server::{
-    router::{CapabilitiesBuilder, Router, RouterService},
+    router::{Router, RouterService},
     ByteTransport, Server,
 };
 use serde_json::Value;
@@ -71,57 +72,48 @@ impl ProxyRouter {
         //
         // For demonstration, here's a hypothetical set of endpoints/processes:
         // SSE to server A
-        let transport_a = SseTransport::new("http://localhost:7000/sse", HashMap::new());
-        // SSE to server B
-        let transport_b = SseTransport::new("http://localhost:8000/sse", HashMap::new());
+        let transport_a = SseTransport::new("http://localhost:8009/sse", HashMap::new());
         // A stdio-based server (for example, could be `cargo run -p mcp-server` or some other command)
         let transport_c = StdioTransport::new(
-            "cargo",
-            vec!["run", "-p", "mcp-server"],
+            "npx".to_string(),
+            vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
             HashMap::new(),
         );
 
         // 2) Start each transport (async), producing a handle
         let handle_a = transport_a.start().await?;
-        let handle_b = transport_b.start().await?;
         let handle_c = transport_c.start().await?;
 
         // 3) Wrap each transport handle in a Tower service with optional timeouts
         let service_a = McpService::with_timeout(handle_a, std::time::Duration::from_secs(10));
-        let service_b = McpService::with_timeout(handle_b, std::time::Duration::from_secs(10));
         let service_c = McpService::with_timeout(handle_c, std::time::Duration::from_secs(10));
 
         // 4) Create an McpClient for each
         let mut client_a = McpClient::new(service_a);
-        let mut client_b = McpClient::new(service_b);
         let mut client_c = McpClient::new(service_c);
 
         // 5) Initialize each upstream server connection. In a real system, you might:
         //    - pass different ClientInfo or capabilities to each
         //    - handle errors individually
-        let info = ClientInfo {
-            name: "ProxyUpstream".into(),
-            version: "1.0.0".into(),
-        };
-        let caps = ClientCapabilities::default();
-
-        let init_a = client_a.initialize(info.clone(), caps.clone()).await?;
-        let init_b = client_b.initialize(info.clone(), caps.clone()).await?;
-        let init_c = client_c.initialize(info.clone(), caps.clone()).await?;
+        let init_a = client_a.initialize(
+            ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() },
+            ClientCapabilities::default(),
+        ).await?;
+        let init_c = client_c.initialize(
+            ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() },
+            ClientCapabilities::default(),
+        ).await?;
 
         // 6) Aggregate server capabilities (union) from all upstreams
         let aggregated_caps = merge_server_capabilities(&[
             init_a.capabilities.clone(),
-            init_b.capabilities.clone(),
             init_c.capabilities.clone(),
         ]);
 
         // For instructions, just combine them in some naive way:
         let instructions = format!(
-            "Proxy aggregator of 3 upstream servers.\nServer A instructions:\n{}\n\n\
-             Server B instructions:\n{}\n\nServer C instructions:\n{}\n",
+            "Proxy aggregator of 3 upstream servers.\nServer A instructions:\n{}\n\nServer C instructions:\n{}\n",
             init_a.instructions.unwrap_or_default(),
-            init_b.instructions.unwrap_or_default(),
             init_c.instructions.unwrap_or_default()
         );
 
@@ -131,7 +123,6 @@ impl ProxyRouter {
         Ok(Self {
             upstream_clients: Arc::new(vec![
                 Box::new(client_a),
-                Box::new(client_b),
                 Box::new(client_c),
             ]),
             name,
@@ -149,20 +140,14 @@ fn merge_server_capabilities(caps_list: &[ServerCapabilities]) -> ServerCapabili
     let mut resources_enabled = false;
     let mut tools_enabled = false;
     for caps in caps_list {
-        if let Some(ref p) = caps.prompts {
-            if p.list_changed.is_some() {
-                prompts_enabled = true;
-            }
+        if caps.prompts.is_some() {
+            prompts_enabled = true;
         }
-        if let Some(ref r) = caps.resources {
-            if r.subscribe.is_some() || r.list_changed.is_some() {
-                resources_enabled = true;
-            }
+        if caps.resources.is_some() {
+            resources_enabled = true;
         }
-        if let Some(ref t) = caps.tools {
-            if t.list_changed.is_some() {
-                tools_enabled = true;
-            }
+        if caps.tools.is_some() {
+            tools_enabled = true;
         }
     }
     let prompts = prompts_enabled.then(|| PromptsCapability { list_changed: Some(true) });
@@ -208,7 +193,7 @@ impl Router for ProxyRouter {
                 Ok(result) => {
                     for t in result.tools {
                         // Add any new ones that aren't duplicates
-                        if !all_tools.iter().any(|existing| existing.name == t.name) {
+                        if !all_tools.iter().any(|existing: &Tool| existing.name == t.name) {
                             all_tools.push(t);
                         }
                     }
@@ -278,7 +263,7 @@ impl Router for ProxyRouter {
             match rt.block_on(client.list_resources(None)) {
                 Ok(result) => {
                     for r in result.resources {
-                        if !all_resources.iter().any(|existing| existing.uri == r.uri) {
+                        if !all_resources.iter().any(|existing: &Resource| existing.uri == r.uri) {
                             all_resources.push(r);
                         }
                     }
@@ -303,12 +288,10 @@ impl Router for ProxyRouter {
                 match client.read_resource(&uri).await {
                     Ok(res) => {
                         // If found, return
+                        // 简化处理方式，避免复杂的枚举模式匹配
                         return Ok(res.contents
                             .iter()
-                            .map(|c| match c {
-                                ResourceContents::TextResourceContents { text, .. } => text.clone(),
-                                ResourceContents::BlobResourceContents { blob, .. } => blob.clone(),
-                            })
+                            .map(|c| format!("{:?}", c))  // 简单使用Debug输出
                             .collect::<Vec<_>>()
                             .join("\n"));
                     }
@@ -330,7 +313,7 @@ impl Router for ProxyRouter {
             match rt.block_on(client.list_prompts(None)) {
                 Ok(result) => {
                     for p in result.prompts {
-                        if !all_prompts.iter().any(|existing| existing.name == p.name) {
+                        if !all_prompts.iter().any(|existing: &Prompt| existing.name == p.name) {
                             all_prompts.push(p);
                         }
                     }
