@@ -41,7 +41,9 @@ use mcp_server::{
 };
 use serde_json::Value;
 use tokio::io::{stdin, stdout};
+use tracing::{info, debug, warn, error};
 use tracing_subscriber::EnvFilter;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 /// A struct that holds multiple MCP clients (each connected to an upstream MCP server),
 /// and implements the MCP Server `Router` trait by aggregating or proxying calls to them.
@@ -59,6 +61,12 @@ struct ProxyRouter {
 
     /// An aggregated set of capabilities (union) from all upstream servers.
     capabilities: ServerCapabilities,
+
+    /// Shared runtime for blocking calls
+    rt: Arc<tokio::runtime::Runtime>,
+
+    /// Cached tools from all upstream clients
+    cached_tools: Arc<Vec<Tool>>,
 }
 
 impl ProxyRouter {
@@ -67,48 +75,105 @@ impl ProxyRouter {
     /// In this example, we connect to two SSE endpoints and one stdio process,
     /// just to illustrate how you might combine them. Adjust as you like.
     pub async fn new() -> anyhow::Result<Self> {
+        info!("Creating new ProxyRouter...");
+        // 创建共享的 Runtime
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        
         // 1) Build a list of "transports" that connect to your upstream servers
         //    e.g. SseTransport, StdioTransport, etc.
         //
         // For demonstration, here's a hypothetical set of endpoints/processes:
         // SSE to server A
         let transport_a = SseTransport::new("http://localhost:8009/sse", HashMap::new());
+        debug!("Created SseTransport to http://localhost:8009/sse");
+        
         // A stdio-based server (for example, could be `cargo run -p mcp-server` or some other command)
         let transport_c = StdioTransport::new(
             "npx".to_string(),
             vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
             HashMap::new(),
         );
+        debug!("Created StdioTransport running npx @modelcontextprotocol/server-everything");
 
         // 2) Start each transport (async), producing a handle
-        let handle_a = transport_a.start().await?;
-        let handle_c = transport_c.start().await?;
+        info!("Starting transports...");
+        let handle_a = match transport_a.start().await {
+            Ok(handle) => {
+                info!("Successfully started SseTransport A");
+                handle
+            },
+            Err(e) => {
+                error!("Failed to start SseTransport A: {}", e);
+                return Err(e.into());
+            }
+        };
+        
+        let handle_c = match transport_c.start().await {
+            Ok(handle) => {
+                info!("Successfully started StdioTransport C");
+                handle
+            },
+            Err(e) => {
+                error!("Failed to start StdioTransport C: {}", e);
+                return Err(e.into());
+            }
+        };
 
         // 3) Wrap each transport handle in a Tower service with optional timeouts
+        debug!("Creating McpServices with timeouts...");
         let service_a = McpService::with_timeout(handle_a, std::time::Duration::from_secs(10));
-        let service_c = McpService::with_timeout(handle_c, std::time::Duration::from_secs(10));
+        let service_c = McpService::with_timeout(handle_c, std::time::Duration::from_secs(30));
 
         // 4) Create an McpClient for each
+        debug!("Creating McpClients...");
         let mut client_a = McpClient::new(service_a);
         let mut client_c = McpClient::new(service_c);
 
         // 5) Initialize each upstream server connection. In a real system, you might:
         //    - pass different ClientInfo or capabilities to each
         //    - handle errors individually
-        let init_a = client_a.initialize(
-            ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() },
+        info!("Initializing connection to upstream servers...");
+        let client_info_a = ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() };
+        let client_info_c = ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() };
+        info!("Using client name: ProxyUpstream, version: 1.0.0");
+        
+        let init_a = match client_a.initialize(
+            client_info_a,
             ClientCapabilities::default(),
-        ).await?;
-        let init_c = client_c.initialize(
-            ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() },
+        ).await {
+            Ok(init) => {
+                info!("Successfully initialized client A");
+                debug!("Client A capabilities: {:?}", init.capabilities);
+                init
+            },
+            Err(e) => {
+                error!("Failed to initialize client A: {}", e);
+                return Err(e.into());
+            }
+        };
+        
+        let init_c = match client_c.initialize(
+            client_info_c,
             ClientCapabilities::default(),
-        ).await?;
+        ).await {
+            Ok(init) => {
+                info!("Successfully initialized client C");
+                debug!("Client C capabilities: {:?}", init.capabilities);
+                init
+            },
+            Err(e) => {
+                error!("Failed to initialize client C: {}", e);
+                return Err(e.into());
+            }
+        };
 
         // 6) Aggregate server capabilities (union) from all upstreams
+        debug!("Merging server capabilities...");
         let aggregated_caps = merge_server_capabilities(&[
             init_a.capabilities.clone(),
             init_c.capabilities.clone(),
         ]);
+        debug!("Aggregated capabilities: {:?}", aggregated_caps);
 
         // For instructions, just combine them in some naive way:
         let instructions = format!(
@@ -118,16 +183,45 @@ impl ProxyRouter {
         );
 
         let name = "mcp-proxy-server".to_string();
+        info!("ProxyRouter created successfully with name: {}", name);
+
+        // Create list of clients for caching tools
+        let upstream_clients = vec![
+            Box::new(client_a) as Box<dyn McpClientTrait>,
+            Box::new(client_c) as Box<dyn McpClientTrait>,
+        ];
+
+        // Cache tools from all clients during initialization
+        info!("Caching tools from all upstream clients...");
+        let mut cached_tools = Vec::new();
+        for (idx, client) in upstream_clients.iter().enumerate() {
+            match client.list_tools(None).await {
+                Ok(result) => {
+                    debug!("Client {}: cached {} tools", idx, result.tools.len());
+                    for t in result.tools {
+                        // Add any new ones that aren't duplicates
+                        if !cached_tools.iter().any(|existing: &Tool| existing.name == t.name) {
+                            debug!("Caching tool: {}", t.name);
+                            cached_tools.push(t);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // If an upstream is unreachable, we skip it
+                    error!("Client {}: initial list_tools error: {}", idx, e);
+                }
+            }
+        }
+        info!("Cached {} tools from all upstream clients", cached_tools.len());
 
         // 7) Return a ProxyRouter that holds them
         Ok(Self {
-            upstream_clients: Arc::new(vec![
-                Box::new(client_a),
-                Box::new(client_c),
-            ]),
+            upstream_clients: Arc::new(upstream_clients),
             name,
             instructions,
             capabilities: aggregated_caps,
+            rt: Arc::clone(&rt),
+            cached_tools: Arc::new(cached_tools),
         })
     }
 }
@@ -182,29 +276,10 @@ impl Router for ProxyRouter {
         self.capabilities.clone()
     }
 
-    /// Union of all upstream "tools"
+    /// Return cached tools instead of querying upstream clients each time
     fn list_tools(&self) -> Vec<Tool> {
-        let mut all_tools = vec![];
-        for client in self.upstream_clients.iter() {
-            // For each client, call list_tools synchronously (blocking on the future).
-            // This is a toy example, you'd probably do something more advanced in production.
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            match rt.block_on(client.list_tools(None)) {
-                Ok(result) => {
-                    for t in result.tools {
-                        // Add any new ones that aren't duplicates
-                        if !all_tools.iter().any(|existing: &Tool| existing.name == t.name) {
-                            all_tools.push(t);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // If an upstream is unreachable, we skip it
-                    eprintln!("list_tools: ignoring upstream error: {}", e);
-                }
-            }
-        }
-        all_tools
+        debug!("ProxyRouter: returning {} cached tools", self.cached_tools.len());
+        self.cached_tools.to_vec()
     }
 
     /// When a tool is called, search each upstream to see if it has that tool. If found, call it.
@@ -213,20 +288,26 @@ impl Router for ProxyRouter {
         tool_name: &str,
         arguments: Value,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Content>, ToolError>> + Send>> {
+        info!("ProxyRouter: call_tool '{}' with arguments: {}", tool_name, arguments);
         let tool_name = tool_name.to_string();
         let arguments = arguments.clone();
         let upstream_clients = self.upstream_clients.clone();
         Box::pin(async move {
-            for client in upstream_clients.iter() {
+            for (idx, client) in upstream_clients.iter().enumerate() {
+                debug!("Checking client {} for tool '{}'", idx, tool_name);
                 // Check if this server has the tool
                 let tools_res = client.list_tools(None).await;
                 let Ok(tools) = tools_res else { 
+                    warn!("Client {}: failed to list tools", idx);
                     continue; 
                 };
                 let found = tools.tools.iter().any(|t| t.name == tool_name);
                 if !found {
+                    debug!("Client {}: tool '{}' not found", idx, tool_name);
                     continue;
                 }
+                
+                debug!("Client {}: found tool '{}', calling it", idx, tool_name);
                 // If found, call the tool
                 let call_res = client.call_tool(&tool_name, arguments.clone()).await;
                 match call_res {
@@ -235,9 +316,11 @@ impl Router for ProxyRouter {
                         let content = result.content;
                         let is_err = result.is_error.unwrap_or(false);
                         if !is_err {
+                            info!("Client {}: tool '{}' call succeeded", idx, tool_name);
                             return Ok(content);
                         } else {
                             // If server indicated error in the tool call
+                            warn!("Client {}: tool '{}' call returned error status", idx, tool_name);
                             return Err(ToolError::ExecutionError(
                                 "Upstream server indicated error".to_string(),
                             ));
@@ -245,12 +328,13 @@ impl Router for ProxyRouter {
                     }
                     Err(e) => {
                         // Upstream call error -> try next server
-                        eprintln!("call_tool error from one server: {}", e);
+                        error!("Client {}: tool '{}' call error: {}", idx, tool_name, e);
                         // keep going
                     }
                 }
             }
             // If none of the upstreams had the tool or returned success
+            error!("Tool '{}' not found in any upstream server", tool_name);
             Err(ToolError::NotFound(format!("Tool {} not found upstream", tool_name)))
         })
     }
@@ -258,21 +342,23 @@ impl Router for ProxyRouter {
     /// Union of all upstream "resources"
     fn list_resources(&self) -> Vec<Resource> {
         let mut all_resources = vec![];
-        for client in self.upstream_clients.iter() {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            match rt.block_on(client.list_resources(None)) {
+        for (idx, client) in self.upstream_clients.iter().enumerate() {
+            match self.rt.block_on(client.list_resources(None)) {
                 Ok(result) => {
+                    debug!("Client {}: retrieved {} resources", idx, result.resources.len());
                     for r in result.resources {
                         if !all_resources.iter().any(|existing: &Resource| existing.uri == r.uri) {
+                            debug!("Adding resource: {}", r.uri);
                             all_resources.push(r);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("list_resources: ignoring upstream error: {}", e);
+                    error!("Client {}: list_resources error: {}", idx, e);
                 }
             }
         }
+        debug!("ProxyRouter: returning {} aggregated resources", all_resources.len());
         all_resources
     }
 
@@ -281,14 +367,15 @@ impl Router for ProxyRouter {
         &self,
         uri: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, ResourceError>> + Send>> {
+        info!("ProxyRouter: read_resource '{}'", uri);
         let uri = uri.to_string();
         let upstream_clients = self.upstream_clients.clone();
         Box::pin(async move {
-            for client in upstream_clients.iter() {
+            for (idx, client) in upstream_clients.iter().enumerate() {
+                debug!("Checking client {} for resource '{}'", idx, uri);
                 match client.read_resource(&uri).await {
                     Ok(res) => {
-                        // If found, return
-                        // 简化处理方式，避免复杂的枚举模式匹配
+                        info!("Client {}: found resource '{}'", idx, uri);
                         return Ok(res.contents
                             .iter()
                             .map(|c| format!("{:?}", c))  // 简单使用Debug输出
@@ -296,11 +383,12 @@ impl Router for ProxyRouter {
                             .join("\n"));
                     }
                     Err(e) => {
-                        eprintln!("read_resource ignoring upstream error: {}", e);
+                        warn!("Client {}: read_resource '{}' error: {}", idx, uri, e);
                         // keep going
                     }
                 }
             }
+            error!("Resource '{}' not found in any upstream server", uri);
             Err(ResourceError::NotFound(format!("Resource {} not found in any upstream", uri)))
         })
     }
@@ -308,21 +396,23 @@ impl Router for ProxyRouter {
     /// Union of all upstream prompts
     fn list_prompts(&self) -> Vec<Prompt> {
         let mut all_prompts = vec![];
-        for client in self.upstream_clients.iter() {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            match rt.block_on(client.list_prompts(None)) {
+        for (idx, client) in self.upstream_clients.iter().enumerate() {
+            match self.rt.block_on(client.list_prompts(None)) {
                 Ok(result) => {
+                    debug!("Client {}: retrieved {} prompts", idx, result.prompts.len());
                     for p in result.prompts {
                         if !all_prompts.iter().any(|existing: &Prompt| existing.name == p.name) {
+                            debug!("Adding prompt: {}", p.name);
                             all_prompts.push(p);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("list_prompts: ignoring upstream error: {}", e);
+                    error!("Client {}: list_prompts error: {}", idx, e);
                 }
             }
         }
+        debug!("ProxyRouter: returning {} aggregated prompts", all_prompts.len());
         all_prompts
     }
 
@@ -370,25 +460,61 @@ impl Router for ProxyRouter {
 /// and listens for incoming JSON-RPC from downstream clients.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "mcp-server.log");
+
+    // Initialize logging with more detailed settings
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env().add_directive("mcp_client=debug".parse().unwrap()),
+            EnvFilter::from_default_env()
+                .add_directive("mcp_client=debug".parse().unwrap())
+                .add_directive("mcp_server=debug".parse().unwrap())
+                .add_directive("mcp_spec=debug".parse().unwrap())
         )
+        .with_writer(file_appender)
         .init();
 
+    info!("Starting MCP Proxy Server...");
+
     // Build the aggregator router (connect to upstream servers, gather capabilities).
-    let proxy_router = ProxyRouter::new().await?;
+    info!("Initializing ProxyRouter...");
+    let proxy_router = match ProxyRouter::new().await {
+        Ok(router) => {
+            info!("ProxyRouter initialized successfully");
+            router
+        },
+        Err(e) => {
+            error!("Failed to initialize ProxyRouter: {}", e);
+            return Err(e);
+        }
+    };
+    
     let service = RouterService(proxy_router);
+    info!("Created RouterService");
 
     // Wrap in the mcp_server's ByteTransport (reading from stdin, writing to stdout).
-    let transport = ByteTransport::new(stdin(), stdout());
+    let stdin = stdin();
+    let stdout = stdout();
+    debug!("Creating ByteTransport with stdin/stdout...");
+    let transport = ByteTransport::new(stdin, stdout);
+    
+    debug!("Creating Server with RouterService...");
     let server = Server::new(service);
 
     // Run until EOF or other I/O break. This will block the current task.
-    println!("Proxy MCP Server: starting main loop on stdin/stdout...");
-    server.run(transport).await?;
-    println!("Proxy MCP Server: shutting down.");
+    info!("Proxy MCP Server: starting main loop on stdin/stdout...");
+
+    match server.run(transport).await {
+        Ok(_) => {
+            info!("Proxy MCP Server: main loop completed normally");
+        },
+        Err(e) => {
+            error!("Proxy MCP Server: error in main loop: {}", e);
+            error!("Error details: {:?}", e);
+            return Err(e.into());
+        }
+    }
+    
+    info!("Proxy MCP Server: shutting down.");
 
     Ok(())
 }

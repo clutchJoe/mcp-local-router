@@ -691,6 +691,8 @@ dependencies = [
  "mcp-spec",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
