@@ -15,8 +15,12 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
+    path::PathBuf,
+    fs,
 };
 
+use clap::Parser;
+use serde::{Deserialize, Serialize};
 use mcp_client::{
     client::{ClientCapabilities, ClientInfo, McpClient, McpClientTrait},
     service::McpService,
@@ -44,6 +48,36 @@ use tokio::io::{stdin, stdout};
 use tracing::{info, debug, warn, error};
 use tracing_subscriber::EnvFilter;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+
+/// Command line arguments
+#[derive(Parser, Debug)]
+#[clap(author, version, about)]
+struct Args {
+    /// Path to the MCP server configuration file
+    #[clap(short, long, required = true, value_parser = clap::value_parser!(PathBuf))]
+    config: PathBuf,
+}
+
+/// MCP Server configuration file structure
+#[derive(Debug, Serialize, Deserialize)]
+struct Config {
+    /// Map of server name to server configuration
+    #[serde(default)]
+    mcpServers: HashMap<String, ServerConfig>,
+}
+
+/// Configuration for a specific MCP server
+#[derive(Debug, Serialize, Deserialize)]
+struct ServerConfig {
+    /// Command to execute
+    command: String,
+    /// Command arguments
+    #[serde(default)]
+    args: Vec<String>,
+    /// Environment variables to pass to the command
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
 
 /// A struct that holds multiple MCP clients (each connected to an upstream MCP server),
 /// and implements the MCP Server `Router` trait by aggregating or proxying calls to them.
@@ -74,126 +108,156 @@ impl ProxyRouter {
     ///
     /// In this example, we connect to two SSE endpoints and one stdio process,
     /// just to illustrate how you might combine them. Adjust as you like.
-    pub async fn new() -> anyhow::Result<Self> {
+    pub async fn new(config_path: Option<PathBuf>) -> anyhow::Result<Self> {
         info!("Creating new ProxyRouter...");
         // 创建共享的 Runtime
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
-        
-        // 1) Build a list of "transports" that connect to your upstream servers
-        //    e.g. SseTransport, StdioTransport, etc.
-        //
-        // For demonstration, here's a hypothetical set of endpoints/processes:
-        // SSE to server A
-        let transport_a = SseTransport::new("http://localhost:8009/sse", HashMap::new());
-        debug!("Created SseTransport to http://localhost:8009/sse");
-        
-        // A stdio-based server (for example, could be `cargo run -p mcp-server` or some other command)
-        let transport_c = StdioTransport::new(
-            "npx".to_string(),
-            vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
-            HashMap::new(),
-        );
-        debug!("Created StdioTransport running npx @modelcontextprotocol/server-everything");
 
-        // 2) Start each transport (async), producing a handle
-        info!("Starting transports...");
-        let handle_a = match transport_a.start().await {
-            Ok(handle) => {
-                info!("Successfully started SseTransport A");
-                handle
-            },
+        // 记录客户端列表
+        let mut upstream_clients: Vec<Box<dyn McpClientTrait>> = Vec::new();
+        let mut cached_tools = Vec::new();
+        
+        // 从配置文件加载 transports
+        let path = config_path.ok_or_else(|| anyhow::anyhow!("Config file path is required"))?;
+        info!("Loading server configuration from: {:?}", path);
+        let contents = match fs::read_to_string(&path) {
+            Ok(content) => content,
             Err(e) => {
-                error!("Failed to start SseTransport A: {}", e);
-                return Err(e.into());
+                error!("Failed to read config file '{}': {}", path.display(), e);
+                std::process::exit(1);
             }
         };
         
-        let handle_c = match transport_c.start().await {
-            Ok(handle) => {
-                info!("Successfully started StdioTransport C");
-                handle
-            },
+        let config: Config = match serde_json::from_str(&contents) {
+            Ok(config) => config,
             Err(e) => {
-                error!("Failed to start StdioTransport C: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        // 3) Wrap each transport handle in a Tower service with optional timeouts
-        debug!("Creating McpServices with timeouts...");
-        let service_a = McpService::with_timeout(handle_a, std::time::Duration::from_secs(10));
-        let service_c = McpService::with_timeout(handle_c, std::time::Duration::from_secs(30));
-
-        // 4) Create an McpClient for each
-        debug!("Creating McpClients...");
-        let mut client_a = McpClient::new(service_a);
-        let mut client_c = McpClient::new(service_c);
-
-        // 5) Initialize each upstream server connection. In a real system, you might:
-        //    - pass different ClientInfo or capabilities to each
-        //    - handle errors individually
-        info!("Initializing connection to upstream servers...");
-        let client_info_a = ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() };
-        let client_info_c = ClientInfo { name: "ProxyUpstream".into(), version: "1.0.0".into() };
-        info!("Using client name: ProxyUpstream, version: 1.0.0");
-        
-        let init_a = match client_a.initialize(
-            client_info_a,
-            ClientCapabilities::default(),
-        ).await {
-            Ok(init) => {
-                info!("Successfully initialized client A");
-                debug!("Client A capabilities: {:?}", init.capabilities);
-                init
-            },
-            Err(e) => {
-                error!("Failed to initialize client A: {}", e);
-                return Err(e.into());
+                error!("Failed to parse JSON config file '{}': {}", path.display(), e);
+                error!("Please ensure the file is valid JSON format with the structure as shown in mcp.example.json");
+                std::process::exit(1);
             }
         };
         
-        let init_c = match client_c.initialize(
-            client_info_c,
-            ClientCapabilities::default(),
-        ).await {
-            Ok(init) => {
-                info!("Successfully initialized client C");
-                debug!("Client C capabilities: {:?}", init.capabilities);
-                init
-            },
-            Err(e) => {
-                error!("Failed to initialize client C: {}", e);
-                return Err(e.into());
-            }
-        };
+        if config.mcpServers.is_empty() {
+            error!("No MCP servers defined in config file '{}'", path.display());
+            std::process::exit(1);
+        }
+        
+        // 从配置中创建 transports
+        for (server_name, server_config) in config.mcpServers.iter() {
+            info!("Creating transport for server: {}", server_name);
+            
+            // 创建 StdioTransport
+            let transport = StdioTransport::new(
+                server_config.command.clone(),
+                server_config.args.clone(),
+                server_config.env.clone(),
+            );
+            debug!("Created StdioTransport for server {}: {} {:?}", 
+                  server_name, server_config.command, server_config.args);
+            
+            // 启动 transport
+            let handle = match transport.start().await {
+                Ok(handle) => {
+                    info!("Successfully started StdioTransport for server: {}", server_name);
+                    handle
+                },
+                Err(e) => {
+                    error!("Failed to start StdioTransport for server {}: {}", server_name, e);
+                    continue;
+                }
+            };
+            
+            // 创建 McpService
+            let service = McpService::with_timeout(handle, std::time::Duration::from_secs(30));
+            
+            // 创建 McpClient
+            let mut client = McpClient::new(service);
+            
+            // 初始化连接
+            let client_info = ClientInfo { 
+                name: "ProxyUpstream".into(), 
+                version: "1.0.0".into() 
+            };
+            
+            match client.initialize(
+                client_info,
+                ClientCapabilities::default(),
+            ).await {
+                Ok(init) => {
+                    info!("Successfully initialized client for server: {}", server_name);
+                    debug!("Client {} capabilities: {:?}", server_name, init.capabilities);
+                    
+                    // 添加到客户端列表
+                    upstream_clients.push(Box::new(client) as Box<dyn McpClientTrait>);
+                },
+                Err(e) => {
+                    error!("Failed to initialize client for server {}: {}", server_name, e);
+                    continue;
+                }
+            };
+        }
+        
+        // 如果没有成功连接的客户端，返回错误
+        if upstream_clients.is_empty() {
+            return Err(anyhow::anyhow!("Failed to connect to any MCP servers"));
+        }
 
-        // 6) Aggregate server capabilities (union) from all upstreams
+        // 3) 聚合 server capabilities
         debug!("Merging server capabilities...");
-        let aggregated_caps = merge_server_capabilities(&[
-            init_a.capabilities.clone(),
-            init_c.capabilities.clone(),
-        ]);
+        
+        // 获取每个客户端的 capabilities
+        let mut all_caps = Vec::new();
+        for (idx, client) in upstream_clients.iter().enumerate() {
+            // 尝试获取每个客户端的 capabilities
+            if let Ok(info) = client.list_tools(None).await {
+                if !info.tools.is_empty() {
+                    debug!("Client {}: found {} tools", idx, info.tools.len());
+                    // 如果客户端有工具，我们假设它支持 tools capability
+                    all_caps.push(ServerCapabilities {
+                        tools: Some(ToolsCapability { list_changed: Some(true) }),
+                        prompts: None,
+                        resources: None,
+                    });
+                }
+            }
+            
+            if let Ok(info) = client.list_prompts(None).await {
+                if !info.prompts.is_empty() {
+                    debug!("Client {}: found {} prompts", idx, info.prompts.len());
+                    // 如果客户端有提示，我们假设它支持 prompts capability
+                    all_caps.push(ServerCapabilities {
+                        tools: None,
+                        prompts: Some(PromptsCapability { list_changed: Some(true) }),
+                        resources: None,
+                    });
+                }
+            }
+            
+            if let Ok(info) = client.list_resources(None).await {
+                if !info.resources.is_empty() {
+                    debug!("Client {}: found {} resources", idx, info.resources.len());
+                    // 如果客户端有资源，我们假设它支持 resources capability
+                    all_caps.push(ServerCapabilities {
+                        tools: None,
+                        prompts: None,
+                        resources: Some(ResourcesCapability { list_changed: Some(true), subscribe: Some(true) }),
+                    });
+                }
+            }
+        }
+        
+        let aggregated_caps = merge_server_capabilities(&all_caps);
         debug!("Aggregated capabilities: {:?}", aggregated_caps);
 
-        // For instructions, just combine them in some naive way:
-        let instructions = format!(
-            "Proxy aggregator of 3 upstream servers.\nServer A instructions:\n{}\n\nServer C instructions:\n{}\n",
-            init_a.instructions.unwrap_or_default(),
-            init_c.instructions.unwrap_or_default()
-        );
+        // 简单组合所有服务器的 instructions
+        let instructions = String::from("Proxy aggregator of upstream servers.\n");
+        // 由于没法获取每个服务器的指令，我们使用默认指令
 
         let name = "mcp-proxy-server".to_string();
         info!("ProxyRouter created successfully with name: {}", name);
 
-        // Create list of clients for caching tools
-        let upstream_clients = vec![
-            Box::new(client_a) as Box<dyn McpClientTrait>,
-            Box::new(client_c) as Box<dyn McpClientTrait>,
-        ];
-
-        // Cache tools from all clients during initialization
+        // 缓存所有客户端的工具
         info!("Caching tools from all upstream clients...");
-        let mut cached_tools = Vec::new();
         for (idx, client) in upstream_clients.iter().enumerate() {
             match client.list_tools(None).await {
                 Ok(result) => {
@@ -474,17 +538,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!("Starting MCP Proxy Server...");
+    
+    // 解析命令行参数
+    let args = Args::parse();
+    info!("Command line arguments: {:?}", args);
 
     // Build the aggregator router (connect to upstream servers, gather capabilities).
     info!("Initializing ProxyRouter...");
-    let proxy_router = match ProxyRouter::new().await {
+    let proxy_router = match ProxyRouter::new(Some(args.config)).await {
         Ok(router) => {
             info!("ProxyRouter initialized successfully");
             router
         },
         Err(e) => {
             error!("Failed to initialize ProxyRouter: {}", e);
-            return Err(e);
+            std::process::exit(1);
         }
     };
     
@@ -510,7 +578,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             error!("Proxy MCP Server: error in main loop: {}", e);
             error!("Error details: {:?}", e);
-            return Err(e.into());
+            std::process::exit(1);
         }
     }
     

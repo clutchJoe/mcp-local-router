@@ -1,0 +1,9 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Project Briefing(MUST-READ!!!)
+- written in rust
+- build a Proxy Server for the Model Context Protocol(MCP)
+- use english in readme.md
