@@ -16,7 +16,7 @@ This project is an MCP (Model Context Protocol) local router that serves as an a
 It must be run with a configuration file:
 
 ```bash
-cargo run -- --config mcp-config.json
+cargo run -- --config mcp-config.json --transport sse
 ```
 
 ### Configuration File Format
@@ -65,11 +65,11 @@ Description:
 cargo build --release
 
 # Run
-cargo run --release -- --config mcp-config.json
+cargo run --release -- --config mcp-config.json --transport stdio
 ```
 
 ## Dependencies
 
 - Rust 2021 Edition
 - tokio async runtime
-- MCP-related libraries: mcp-client, mcp-core, mcp-server, mcp-spec
+- MCP-related libraries: [rmcp](https://github.com/modelcontextprotocol/rust-sdk)
