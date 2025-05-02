@@ -53,7 +53,7 @@ struct Args {
 struct AggregatorService {
     // Key = tool name (Cow<'static, str>),
     // Value = (Tool object, which upstream server it came from)
-    clients: Arc<RwLock<HashMap<String, Arc<RunningService<RoleClient, ()>>>>>,
+    clients: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>>>>>,
     tools: Arc<RwLock<HashMap<Cow<'static, str>, (Tool, String)>>>,
 }
 
@@ -81,7 +81,7 @@ impl AggregatorService {
                 .serve(transport)
                 .await
                 .context(format!("Failed to create client service for {name}"))?;
-            let client_arc = Arc::new(client_service);
+            let client_arc = Arc::new(tokio::sync::Mutex::new(Some(client_service)));
 
             // Insert into "clients" map:
             clients
@@ -94,37 +94,58 @@ impl AggregatorService {
             let client_arc_clone = client_arc.clone();
             let tools_clone = tools.clone();
             tokio::spawn(async move {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    client_arc_clone.list_tools(None),
-                )
-                .await
-                {
-                    Ok(Ok(list_result)) => {
-                        let mut tools_guard = tools_clone.write().await;
-                        for tool in list_result.tools {
-                            info!(
-                                "Discovered tool '{}' from upstream '{}'",
-                                tool.name, name_for_discovery
-                            );
-                            tools_guard.insert(
-                                Cow::Owned(tool.name.clone().into_owned()),
-                                (tool, name_for_discovery.clone()),
-                            );
+                let guard = client_arc_clone.lock().await;
+                if let Some(ref client) = *guard {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        client.list_tools(None),
+                    )
+                    .await
+                    {
+                        Ok(Ok(list_result)) => {
+                            let mut tools_guard = tools_clone.write().await;
+                            for tool in list_result.tools {
+                                info!(
+                                    "Discovered tool '{}' from upstream '{}'",
+                                    tool.name, name_for_discovery
+                                );
+                                tools_guard.insert(
+                                    Cow::Owned(tool.name.clone().into_owned()),
+                                    (tool, name_for_discovery.clone()),
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            error!("Failed to list tools from upstream '{}': {}", name_for_discovery, e);
+                        }
+                        Err(_) => {
+                            error!("Tool discovery timed out for upstream '{}'", name_for_discovery);
+                            // Implement retry logic here if needed
                         }
                     }
-                    Ok(Err(e)) => {
-                        error!("Failed to list tools from upstream '{}': {}", name_for_discovery, e);
-                    }
-                    Err(_) => {
-                        error!("Tool discovery timed out for upstream '{}'", name_for_discovery);
-                        // Implement retry logic here if needed
-                    }
+                } else {
+                    error!("Client for '{}' already taken before tool discovery", name_for_discovery);
                 }
             });
         }
 
         Ok(Self { clients, tools })
+    }
+
+    pub async fn shutdown(&self) {
+        let clients = self.clients.read().await;
+        for (name, client_arc) in clients.iter() {
+            info!("Shutting down client {}", name);
+            let mut guard = client_arc.lock().await;
+            if let Some(client) = guard.take() {
+                if let Err(e) = client.cancel().await {
+                    error!("Failed to cancel client {}: {}", name, e);
+                }
+            } else {
+                info!("Client {} already shut down or taken.", name);
+            }
+        }
+        info!("All upstream clients have been shut down.");
     }
 }
 
@@ -159,7 +180,7 @@ impl ServerHandler for AggregatorService {
         let clients_guard = self.clients.read().await;
         let tools_guard = self.tools.read().await;
         if let Some((_tool, client_name)) = tools_guard.get(&*tool_name) {
-            if let Some(client) = clients_guard.get(client_name) {
+            if let Some(client_mutex) = clients_guard.get(client_name) {
                 info!(
                     "Routing call to tool '{}' -> upstream '{}'",
                     tool_name, client_name
@@ -168,15 +189,24 @@ impl ServerHandler for AggregatorService {
                     name: tool_name.clone(),
                     arguments,
                 };
-                match client.call_tool(client_params).await {
-                    Ok(result) => Ok(result),
-                    Err(e) => {
-                        error!(
-                            "Error calling tool '{}' on upstream '{}': {}",
-                            tool_name, client_name, e
-                        );
-                        Err(ErrorData::internal_error(format!("{}", e), None))
+                let guard = client_mutex.lock().await;
+                if let Some(client) = guard.as_ref() {
+                    match client.call_tool(client_params).await {
+                        Ok(result) => Ok(result),
+                        Err(e) => {
+                            error!(
+                                "Error calling tool '{}' on upstream '{}': {}",
+                                tool_name, client_name, e
+                            );
+                            Err(ErrorData::internal_error(format!("{}", e), None))
+                        }
                     }
+                } else {
+                    error!("Client '{}' already shut down or taken.", client_name);
+                    Err(ErrorData::internal_error(
+                        format!("Client '{}' already shut down", client_name),
+                        None,
+                    ))
                 }
             } else {
                 error!(
@@ -238,10 +268,14 @@ async fn async_main() -> Result<()> {
         }
         "sse" => {
             info!("Using SSE transport on {}", args.address);
+            let aggregator_service = Arc::new(aggregator_service);
+            let aggregator_service_for_shutdown = aggregator_service.clone();
             let sse_server = SseServer::serve(args.address.parse()?)
                 .await?
-                .with_service(move || aggregator_service.clone());
+                .with_service(move || aggregator_service.as_ref().clone());
             tokio::signal::ctrl_c().await?;
+            info!("Ctrl+C received, shutting down aggregator service...");
+            aggregator_service_for_shutdown.shutdown().await;
             sse_server.cancel();
             info!("Server stopped (SSE).");
         }
