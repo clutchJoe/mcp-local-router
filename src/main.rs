@@ -90,26 +90,37 @@ impl AggregatorService {
                 .insert(name.clone(), client_arc.clone());
 
             // Asynchronize tool discovery to avoid blocking aggregator initialization
-            let tools_clone = tools.clone();
-            let name_clone = name.clone();
+            let name_for_discovery = name.clone();
+            let name_for_timeout = name.clone();
             let client_arc_clone = client_arc.clone();
-            tokio::spawn(async move {
+            let tools_clone = tools.clone();
+            let discovery_task = tokio::spawn(async move {
                 match client_arc_clone.list_tools(None).await {
                     Ok(list_result) => {
                         let mut tools_guard = tools_clone.write().await;
                         for tool in list_result.tools {
                             info!(
                                 "Discovered tool '{}' from upstream '{}'",
-                                tool.name, name_clone
+                                tool.name, name_for_discovery
                             );
                             tools_guard.insert(
                                 Cow::Owned(tool.name.clone().into_owned()),
-                                (tool, name_clone.clone()),
+                                (tool, name_for_discovery.clone()),
                             );
                         }
                     }
                     Err(e) => {
-                        error!("Failed to list tools from upstream '{}': {}", name_clone, e);
+                        error!("Failed to list tools from upstream '{}': {}", name_for_discovery, e);
+                    }
+                }
+            });
+            // Add timeout and retry logic
+            tokio::spawn(async move {
+                match tokio::time::timeout(std::time::Duration::from_secs(30), discovery_task).await {
+                    Ok(_) => { /* Tool discovery completed successfully */ },
+                    Err(_) => {
+                        error!("Tool discovery timed out for upstream '{}'", name_for_timeout);
+                        // Implement retry logic here if needed
                     }
                 }
             });
@@ -201,12 +212,13 @@ async fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    tracing_log::LogTracer::init()?;
+    tracing_log::LogTracer::init().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .init();
+        .try_init()
+        .ok();
     info!("Starting MCP Local Router with multi-transport");
 
     let args = Args::parse();
