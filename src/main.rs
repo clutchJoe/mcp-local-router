@@ -28,6 +28,8 @@ struct AppConfig {
 struct ServerConfig {
     command: String,
     args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
 }
 
 #[derive(Parser, Debug)]
@@ -68,6 +70,7 @@ impl AggregatorService {
 
             let mut cmd = tokio::process::Command::new(&server_config.command);
             cmd.args(&server_config.args);
+            cmd.envs(&server_config.env);
 
             let transport = TokioChildProcess::new(&mut cmd).context(format!(
                 "Failed to create child process transport for {name}"
