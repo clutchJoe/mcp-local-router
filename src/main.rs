@@ -91,12 +91,16 @@ impl AggregatorService {
 
             // Asynchronize tool discovery to avoid blocking aggregator initialization
             let name_for_discovery = name.clone();
-            let name_for_timeout = name.clone();
             let client_arc_clone = client_arc.clone();
             let tools_clone = tools.clone();
-            let discovery_task = tokio::spawn(async move {
-                match client_arc_clone.list_tools(None).await {
-                    Ok(list_result) => {
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    client_arc_clone.list_tools(None),
+                )
+                .await
+                {
+                    Ok(Ok(list_result)) => {
                         let mut tools_guard = tools_clone.write().await;
                         for tool in list_result.tools {
                             info!(
@@ -109,17 +113,11 @@ impl AggregatorService {
                             );
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         error!("Failed to list tools from upstream '{}': {}", name_for_discovery, e);
                     }
-                }
-            });
-            // Add timeout and retry logic
-            tokio::spawn(async move {
-                match tokio::time::timeout(std::time::Duration::from_secs(30), discovery_task).await {
-                    Ok(_) => { /* Tool discovery completed successfully */ },
                     Err(_) => {
-                        error!("Tool discovery timed out for upstream '{}'", name_for_timeout);
+                        error!("Tool discovery timed out for upstream '{}'", name_for_discovery);
                         // Implement retry logic here if needed
                     }
                 }
