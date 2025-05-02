@@ -16,6 +16,7 @@ use rmcp::{
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing_subscriber::{self, EnvFilter};
+use tracing_log;
 
 #[derive(Deserialize, Debug)]
 struct AppConfig {
@@ -200,6 +201,7 @@ async fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
+    tracing_log::LogTracer::init()?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
         .with_writer(std::io::stderr)
