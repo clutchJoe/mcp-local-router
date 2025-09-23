@@ -16,6 +16,11 @@ tracing-appender = "0.2"
 tracing = "0.1.41"
 log = "0.4"
 tracing-log = "0.1"
+axum = { version = "0.8" }
+futures = "0.3"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+rand = "0.9"
 
 [features]
 cargo-clippy = []
