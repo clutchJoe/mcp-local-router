@@ -5,7 +5,14 @@ edition = "2021"
 
 [dependencies]
 # Enable required features for rmcp
-rmcp = { version = "0.1", features=["client","server","macros", "transport-child-process", "transport-sse-server"] }
+rmcp = { version = "0.2.0", features = [
+  "client",
+  "server",
+  "macros",
+  "transport-child-process",
+  "transport-sse-server",
+] }
+process-wrap = { version = "8.2", features = ["tokio1"] }
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0.81"
 serde_json = "1.0"

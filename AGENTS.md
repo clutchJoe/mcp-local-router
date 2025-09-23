@@ -61,7 +61,7 @@ Example configurations are provided in `mcp.example.json` and `mcp.json`.
 
 ### Dependencies
 
-- **rmcp**: Core MCP SDK with features for client, server, macros, child-process transport, and SSE server
+- **rmcp**: Core MCP SDK (crates.io `0.2.0`) with features for client, server, macros, child-process transport, and SSE server
 - **tokio**: Async runtime with full feature set
 - **tracing**: Structured logging with file appender support
 - **clap**: Command-line argument parsing

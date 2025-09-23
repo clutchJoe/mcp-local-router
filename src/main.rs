@@ -14,6 +14,11 @@ use axum::{
 use clap::Parser;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use log::{error, info};
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::TokioCommandWrap;
 use rand::random;
 use rmcp::{
     model::{
@@ -21,8 +26,8 @@ use rmcp::{
         ListToolsResult, PaginatedRequestParam, Tool,
     },
     service::{
-        serve_server, RequestContext, RoleClient, RunningService, RxJsonRpcMessage, ServiceExt,
-        TxJsonRpcMessage,
+        serve_server_with_ct, RequestContext, RoleClient, RunningService, RxJsonRpcMessage,
+        ServerInitializeError, ServiceExt, TxJsonRpcMessage,
     },
     transport::TokioChildProcess,
     RoleServer, ServerHandler,
@@ -90,11 +95,20 @@ impl AggregatorService {
                 name, server_config.command, server_config.args
             );
 
-            let mut cmd = tokio::process::Command::new(&server_config.command);
-            cmd.args(&server_config.args);
-            cmd.envs(&server_config.env);
+            let mut command_wrap = TokioCommandWrap::with_new(&server_config.command, |command| {
+                command.args(&server_config.args);
+                command.envs(&server_config.env);
+            });
+            #[cfg(unix)]
+            {
+                command_wrap.wrap(ProcessGroup::leader());
+            }
+            #[cfg(windows)]
+            {
+                command_wrap.wrap(JobObject);
+            }
 
-            let transport = TokioChildProcess::new(&mut cmd).context(format!(
+            let transport = TokioChildProcess::new(command_wrap).context(format!(
                 "Failed to create child process transport for {name}"
             ))?;
 
@@ -211,7 +225,7 @@ impl ServerHandler for UpstreamProxyService {
 
     async fn list_tools(
         &self,
-        params: PaginatedRequestParam,
+        params: Option<PaginatedRequestParam>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let guard = self.client.lock().await;
@@ -262,7 +276,7 @@ impl ServerHandler for AggregatorService {
 
     async fn list_tools(
         &self,
-        _params: PaginatedRequestParam,
+        _params: Option<PaginatedRequestParam>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let tools_guard = self.tools.read().await;
@@ -301,13 +315,13 @@ impl ServerHandler for AggregatorService {
                                 "Error calling tool '{}' on upstream '{}': {}",
                                 tool_name, client_name, e
                             );
-                            Err(ErrorData::internal_error(format!("{}", e), None))
+                            Err(ErrorData::internal_error(format!("{e}"), None))
                         }
                     }
                 } else {
                     error!("Client '{}' already shut down or taken.", client_name);
                     Err(ErrorData::internal_error(
-                        format!("Client '{}' already shut down", client_name),
+                        format!("Client '{client_name}' already shut down"),
                         None,
                     ))
                 }
@@ -317,14 +331,14 @@ impl ServerHandler for AggregatorService {
                     client_name, tool_name
                 );
                 Err(ErrorData::internal_error(
-                    format!("Client '{}' not found", client_name),
+                    format!("Client '{client_name}' not found"),
                     None,
                 ))
             }
         } else {
             error!("Tool '{}' not found.", tool_name);
             Err(ErrorData::resource_not_found(
-                format!("Tool '{}' not found", tool_name),
+                format!("Tool '{tool_name}' not found"),
                 None,
             ))
         }
@@ -572,7 +586,80 @@ async fn async_main() -> Result<()> {
         "stdio" => {
             info!("Using stdio transport");
             use tokio::io::{stdin, stdout};
-            serve_server(aggregator_service, (stdin(), stdout())).await?;
+            let aggregator_service = Arc::new(aggregator_service);
+            let aggregator_for_shutdown = aggregator_service.clone();
+            let shutdown_token = CancellationToken::new();
+
+            let running_service = tokio::select! {
+                result = serve_server_with_ct(
+                    aggregator_service.as_ref().clone(),
+                    (stdin(), stdout()),
+                    shutdown_token.clone(),
+                ) => {
+                    match result {
+                        Ok(running) => running,
+                        Err(ServerInitializeError::Cancelled) => {
+                            info!("Server initialization cancelled.");
+                            aggregator_for_shutdown.shutdown().await;
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            aggregator_for_shutdown.shutdown().await;
+                            return Err(err.into());
+                        }
+                    }
+                }
+                ctrl = tokio::signal::ctrl_c() => {
+                    match ctrl {
+                        Ok(()) => info!(
+                            "Ctrl+C received before initialization, shutting down aggregator service..."
+                        ),
+                        Err(err) => error!("Failed to listen for Ctrl+C: {}", err),
+                    }
+                    shutdown_token.cancel();
+                    aggregator_for_shutdown.shutdown().await;
+                    return Ok(());
+                }
+            };
+
+            let (server_done_tx, server_done_rx) = tokio::sync::oneshot::channel();
+            let server_handle = tokio::spawn(async move {
+                let result = running_service.waiting().await;
+                let _ = server_done_tx.send(());
+                result
+            });
+
+            let server_done = async {
+                let _ = server_done_rx.await;
+            };
+
+            tokio::select! {
+                ctrl = tokio::signal::ctrl_c() => {
+                    match ctrl {
+                        Ok(()) => info!("Ctrl+C received, shutting down aggregator service..."),
+                        Err(err) => error!("Failed to listen for Ctrl+C: {}", err),
+                    }
+                }
+                _ = server_done => {
+                    info!("Stdio transport finished");
+                }
+            }
+
+            shutdown_token.cancel();
+            aggregator_for_shutdown.shutdown().await;
+
+            match server_handle.await {
+                Ok(Ok(reason)) => {
+                    info!("Server task finished: {:?}", reason);
+                }
+                Ok(Err(join_err)) => {
+                    error!("Server task join error: {}", join_err);
+                }
+                Err(join_err) => {
+                    error!("Server task panicked: {}", join_err);
+                }
+            }
+
             info!("Server stopped (stdio).");
         }
         "sse" => {
@@ -623,7 +710,8 @@ async fn async_main() -> Result<()> {
                                 if let Err(e) = async {
                                     let running = service
                                         .serve_with_ct(transport, connection_ct.clone())
-                                        .await?;
+                                        .await
+                                        .map_err(io::Error::other)?;
                                     running.waiting().await?;
                                     Ok::<(), io::Error>(())
                                 }
@@ -641,7 +729,8 @@ async fn async_main() -> Result<()> {
                                     info!("Serving upstream '{}' over dedicated SSE", name);
                                     let running = service
                                         .serve_with_ct(transport, connection_ct.clone())
-                                        .await?;
+                                        .await
+                                        .map_err(io::Error::other)?;
                                     running.waiting().await?;
                                     Ok::<(), io::Error>(())
                                 }
