@@ -1,4 +1,12 @@
-use std::{borrow::Cow, collections::HashMap, io, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -13,7 +21,7 @@ use axum::{
 };
 use clap::Parser;
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use log::{error, info};
+use log::{debug, error, info};
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
@@ -22,17 +30,18 @@ use process_wrap::tokio::TokioCommandWrap;
 use rand::random;
 use rmcp::{
     model::{
-        CallToolRequestParam, CallToolResult, ClientJsonRpcMessage, ErrorData, InitializeResult,
-        ListToolsResult, PaginatedRequestParam, Tool,
+        CallToolRequestParam, CallToolResult, ClientJsonRpcMessage, ErrorData, Implementation,
+        InitializeResult, ListToolsResult, PaginatedRequestParam, ServerCapabilities, Tool,
+        ToolsCapability,
     },
     service::{
         serve_server_with_ct, RequestContext, RoleClient, RunningService, RxJsonRpcMessage,
-        ServerInitializeError, ServiceExt, TxJsonRpcMessage,
+        ServerInitializeError, ServiceError, ServiceExt, TxJsonRpcMessage,
     },
     transport::TokioChildProcess,
     RoleServer, ServerHandler,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
@@ -71,6 +80,23 @@ struct Args {
 type ClientHandle = Arc<tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>>;
 type ClientMap = Arc<RwLock<HashMap<String, ClientHandle>>>;
 type ToolStore = Arc<RwLock<HashMap<Cow<'static, str>, (Tool, String)>>>;
+type HealthStore = Arc<RwLock<HashMap<String, UpstreamStatus>>>;
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct UpstreamStatus {
+    is_online: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_success_epoch_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+}
+
+fn now_epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
 
 // ----------------------------------------------------------------
 // AggregatorService: store the discovered tools in a HashMap<String, (Tool, String)>
@@ -81,12 +107,79 @@ struct AggregatorService {
     // Value = (Tool object, which upstream server it came from)
     clients: ClientMap,
     tools: ToolStore,
+    health: HealthStore,
 }
 
 impl AggregatorService {
+    async fn replace_upstream_tools(tools_store: &ToolStore, upstream: &str, new_tools: Vec<Tool>) {
+        let mut tools_guard = tools_store.write().await;
+        tools_guard.retain(|_, (_, owner)| owner != upstream);
+        for tool in new_tools {
+            tools_guard.insert(
+                Cow::Owned(tool.name.clone().into_owned()),
+                (tool, upstream.to_string()),
+            );
+        }
+    }
+
+    async fn clear_upstream_tools(tools_store: &ToolStore, upstream: &str) {
+        let mut tools_guard = tools_store.write().await;
+        tools_guard.retain(|_, (_, owner)| owner != upstream);
+    }
+
+    async fn remove_client(
+        clients_store: &ClientMap,
+        health_store: &HealthStore,
+        upstream: &str,
+        reason: Option<String>,
+    ) {
+        let handle = clients_store.write().await.remove(upstream);
+        if let Some(client_handle) = handle {
+            info!("Removing upstream client '{}'", upstream);
+            let mut guard = client_handle.lock().await;
+            if let Some(client) = guard.take() {
+                if let Err(e) = client.cancel().await {
+                    error!("Failed to cancel client {}: {}", upstream, e);
+                }
+            }
+        }
+        AggregatorService::mark_status_offline(health_store, upstream, reason).await;
+    }
+
+    async fn mark_status_online(health_store: &HealthStore, upstream: &str) {
+        let mut guard = health_store.write().await;
+        let status = guard.entry(upstream.to_string()).or_default();
+        status.is_online = true;
+        status.last_success_epoch_ms = Some(now_epoch_millis());
+        status.last_error = None;
+    }
+
+    async fn mark_status_offline(
+        health_store: &HealthStore,
+        upstream: &str,
+        reason: Option<String>,
+    ) {
+        let mut guard = health_store.write().await;
+        let status = guard.entry(upstream.to_string()).or_default();
+        status.is_online = false;
+        if let Some(reason) = reason {
+            status.last_error = Some(reason);
+        }
+    }
+
+    fn is_fatal_service_error(err: &ServiceError) -> bool {
+        matches!(
+            err,
+            ServiceError::TransportClosed
+                | ServiceError::TransportSend(_)
+                | ServiceError::Cancelled { .. }
+        )
+    }
+
     async fn new(config: AppConfig) -> Result<Self> {
         let clients = Arc::new(RwLock::new(HashMap::new()));
         let tools = Arc::new(RwLock::new(HashMap::new()));
+        let health = Arc::new(RwLock::new(HashMap::new()));
 
         // For each "upstream":
         for (name, server_config) in config.mcp_servers {
@@ -94,6 +187,8 @@ impl AggregatorService {
                 "Setting up upstream server '{}' with command: {} {:?}",
                 name, server_config.command, server_config.args
             );
+
+            health.write().await.entry(name.clone()).or_default();
 
             let mut command_wrap = TokioCommandWrap::with_new(&server_config.command, |command| {
                 command.args(&server_config.args);
@@ -128,52 +223,99 @@ impl AggregatorService {
             let name_for_discovery = name.clone();
             let client_arc_clone = client_arc.clone();
             let tools_clone = tools.clone();
+            let clients_clone = clients.clone();
+            let health_clone = health.clone();
             tokio::spawn(async move {
-                let guard = client_arc_clone.lock().await;
-                if let Some(ref client) = *guard {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        client.list_tools(None),
-                    )
-                    .await
-                    {
-                        Ok(Ok(list_result)) => {
-                            let mut tools_guard = tools_clone.write().await;
-                            for tool in list_result.tools {
+                let discovery_timeout = std::time::Duration::from_secs(30);
+                let retry_delay = std::time::Duration::from_secs(5);
+
+                loop {
+                    let result = {
+                        let guard = client_arc_clone.lock().await;
+                        if let Some(ref client) = *guard {
+                            tokio::time::timeout(discovery_timeout, client.list_all_tools()).await
+                        } else {
+                            debug!(
+                                "Client for '{}' dropped before discovery completed",
+                                name_for_discovery
+                            );
+                            return;
+                        }
+                    };
+
+                    match result {
+                        Ok(Ok(tools_list)) => {
+                            for tool in &tools_list {
                                 info!(
                                     "Discovered tool '{}' from upstream '{}'",
                                     tool.name, name_for_discovery
                                 );
-                                tools_guard.insert(
-                                    Cow::Owned(tool.name.clone().into_owned()),
-                                    (tool, name_for_discovery.clone()),
-                                );
                             }
+                            AggregatorService::replace_upstream_tools(
+                                &tools_clone,
+                                &name_for_discovery,
+                                tools_list,
+                            )
+                            .await;
+                            AggregatorService::mark_status_online(
+                                &health_clone,
+                                &name_for_discovery,
+                            )
+                            .await;
+                            break;
                         }
                         Ok(Err(e)) => {
+                            let error_text = e.to_string();
                             error!(
                                 "Failed to list tools from upstream '{}': {}",
-                                name_for_discovery, e
+                                name_for_discovery, error_text
                             );
+                            AggregatorService::clear_upstream_tools(
+                                &tools_clone,
+                                &name_for_discovery,
+                            )
+                            .await;
+                            AggregatorService::mark_status_offline(
+                                &health_clone,
+                                &name_for_discovery,
+                                Some(error_text.clone()),
+                            )
+                            .await;
+                            if AggregatorService::is_fatal_service_error(&e) {
+                                AggregatorService::remove_client(
+                                    &clients_clone,
+                                    &health_clone,
+                                    &name_for_discovery,
+                                    Some(error_text),
+                                )
+                                .await;
+                                break;
+                            }
                         }
                         Err(_) => {
                             error!(
                                 "Tool discovery timed out for upstream '{}'",
                                 name_for_discovery
                             );
-                            // Implement retry logic here if needed
+                            AggregatorService::mark_status_offline(
+                                &health_clone,
+                                &name_for_discovery,
+                                Some("Tool discovery timed out".to_string()),
+                            )
+                            .await;
                         }
                     }
-                } else {
-                    error!(
-                        "Client for '{}' already taken before tool discovery",
-                        name_for_discovery
-                    );
+
+                    tokio::time::sleep(retry_delay).await;
                 }
             });
         }
 
-        Ok(Self { clients, tools })
+        Ok(Self {
+            clients,
+            tools,
+            health,
+        })
     }
 
     pub async fn shutdown(&self) {
@@ -182,12 +324,28 @@ impl AggregatorService {
             info!("Shutting down client {}", name);
             let mut guard = client_arc.lock().await;
             if let Some(client) = guard.take() {
-                if let Err(e) = client.cancel().await {
-                    error!("Failed to cancel client {}: {}", name, e);
+                // Add timeout to prevent hanging on unresponsive clients
+                match tokio::time::timeout(std::time::Duration::from_secs(5), client.cancel()).await
+                {
+                    Ok(Ok(_)) => {
+                        info!("Client {} shut down successfully", name);
+                    }
+                    Ok(Err(e)) => {
+                        error!("Failed to cancel client {}: {}", name, e);
+                    }
+                    Err(_) => {
+                        error!(
+                            "Timeout shutting down client {} - forcefully terminating",
+                            name
+                        );
+                        // The client didn't respond within timeout, but we continue
+                        // with shutdown rather than hanging indefinitely
+                    }
                 }
             } else {
                 info!("Client {} already shut down or taken.", name);
             }
+            AggregatorService::mark_status_offline(&self.health, name, None).await;
         }
         info!("All upstream clients have been shut down.");
     }
@@ -200,6 +358,10 @@ impl AggregatorService {
     async fn upstream_names(&self) -> Vec<String> {
         let clients = self.clients.read().await;
         clients.keys().cloned().collect()
+    }
+
+    async fn health_snapshot(&self) -> HashMap<String, UpstreamStatus> {
+        self.health.read().await.clone()
     }
 }
 
@@ -220,7 +382,24 @@ impl UpstreamProxyService {
 
 impl ServerHandler for UpstreamProxyService {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult::default()
+        InitializeResult {
+            // 使用默认协议版本；rmcp 0.2.0 的 Default 会填入当前支持的 protocolVersion
+            ..InitializeResult {
+                capabilities: ServerCapabilities {
+                    tools: Some(ToolsCapability::default()),
+                    ..ServerCapabilities::default()
+                },
+                server_info: Implementation {
+                    name: "local-router-upstream-proxy".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+                instructions: Some(format!(
+                    "This endpoint proxies tools/* to the '{}' upstream server.",
+                    self.client_name
+                )),
+                ..InitializeResult::default()
+            }
+        }
     }
 
     async fn list_tools(
@@ -271,7 +450,18 @@ impl ServerHandler for UpstreamProxyService {
 // the signature in rmcp::ServerHandler:
 impl ServerHandler for AggregatorService {
     fn get_info(&self) -> InitializeResult {
-        InitializeResult::default()
+        InitializeResult {
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability::default()),
+                ..ServerCapabilities::default()
+            },
+            server_info: Implementation {
+                name: "local-router".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            instructions: Some("This server aggregates tools from multiple upstream MCP servers. Use tools/list then tools/call.".to_string()),
+            ..InitializeResult::default()
+        }
     }
 
     async fn list_tools(
@@ -279,6 +469,69 @@ impl ServerHandler for AggregatorService {
         _params: Option<PaginatedRequestParam>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        // 如果缓存为空，主动向所有上游拉取一次，避免初始化竞态导致空列表
+        let need_refresh = {
+            let g = self.tools.read().await;
+            g.is_empty()
+        };
+        if need_refresh {
+            let clients = self.clients.read().await;
+            for (name, client_mutex) in clients.iter() {
+                let guard = client_mutex.lock().await;
+                if let Some(client) = guard.as_ref() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        client.list_all_tools(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(tools_list)) => {
+                            AggregatorService::replace_upstream_tools(
+                                &self.tools,
+                                name,
+                                tools_list,
+                            )
+                            .await;
+                            AggregatorService::mark_status_online(&self.health, name).await;
+                        }
+                        Ok(Err(e)) => {
+                            let error_text = e.to_string();
+                            error!(
+                                "list_tools refresh failed for upstream '{}': {}",
+                                name, error_text
+                            );
+                            AggregatorService::clear_upstream_tools(&self.tools, name).await;
+                            AggregatorService::mark_status_offline(
+                                &self.health,
+                                name,
+                                Some(error_text.clone()),
+                            )
+                            .await;
+                            if AggregatorService::is_fatal_service_error(&e) {
+                                AggregatorService::remove_client(
+                                    &self.clients,
+                                    &self.health,
+                                    name,
+                                    Some(error_text),
+                                )
+                                .await;
+                            }
+                        }
+                        Err(_) => {
+                            error!("list_tools refresh timeout for upstream '{}'", name);
+                            AggregatorService::clear_upstream_tools(&self.tools, name).await;
+                            AggregatorService::mark_status_offline(
+                                &self.health,
+                                name,
+                                Some("list_tools refresh timeout".to_string()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+
         let tools_guard = self.tools.read().await;
         let tools_list: Vec<Tool> = tools_guard.values().map(|(tool, _)| tool.clone()).collect();
         Ok(ListToolsResult {
@@ -421,6 +674,11 @@ async fn upstream_sse_handler(
         };
         Err(not_found_response(&detail))
     }
+}
+
+async fn health_handler(State(state): State<RouterState>) -> Json<HashMap<String, UpstreamStatus>> {
+    let snapshot = state.aggregator.health_snapshot().await;
+    Json(snapshot)
 }
 
 fn session_id() -> SessionId {
@@ -683,6 +941,7 @@ async fn async_main() -> Result<()> {
             let router = Router::new()
                 .route("/sse", get(aggregator_sse_handler))
                 .route("/sse/{endpoint}", get(upstream_sse_handler))
+                .route("/health", get(health_handler))
                 .route("/message", post(post_event_handler))
                 .with_state(router_state);
             let server = axum::serve(listener, router).with_graceful_shutdown(async move {
@@ -717,7 +976,17 @@ async fn async_main() -> Result<()> {
                                 }
                                 .await
                                 {
-                                    tracing::error!(error = %e, "Aggregator SSE connection error");
+                                    // Check if this is a cancellation error (normal during shutdown)
+                                    let error_str = e.to_string();
+                                    if error_str.contains("Cancelled")
+                                        || error_str.contains("cancelled")
+                                    {
+                                        tracing::info!(
+                                            "Aggregator SSE connection closed during shutdown"
+                                        );
+                                    } else {
+                                        tracing::error!(error = %e, "Aggregator SSE connection error");
+                                    }
                                 }
                             });
                         }
@@ -736,7 +1005,18 @@ async fn async_main() -> Result<()> {
                                 }
                                 .await
                                 {
-                                    tracing::error!(error = %e, "Upstream SSE connection error");
+                                    // Check if this is a cancellation error (normal during shutdown)
+                                    let error_str = e.to_string();
+                                    if error_str.contains("Cancelled")
+                                        || error_str.contains("cancelled")
+                                    {
+                                        tracing::info!(
+                                            "Upstream '{}' SSE connection closed during shutdown",
+                                            name
+                                        );
+                                    } else {
+                                        tracing::error!(error = %e, "Upstream SSE connection error");
+                                    }
                                 }
                             });
                         }
