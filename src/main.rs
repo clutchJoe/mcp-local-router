@@ -748,9 +748,9 @@ async fn async_main() -> Result<()> {
             info!("Ctrl+C received, shutting down aggregator service...");
             cancellation.cancel();
             drop(transport_tx);
-            aggregator_service_for_shutdown.shutdown().await;
-            processor_handle.await.ok();
             server_handle.await.ok();
+            processor_handle.await.ok();
+            aggregator_service_for_shutdown.shutdown().await;
             info!("Server stopped (SSE).");
         }
         _ => {
