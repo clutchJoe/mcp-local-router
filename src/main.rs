@@ -828,7 +828,8 @@ async fn async_main() -> Result<()> {
         .with_ansi(false)
         .try_init()
         .ok();
-    info!("Starting MCP Local Router with multi-transport");
+    let pid = std::process::id();
+    info!("Starting MCP Local Router with multi-transport (pid: {pid})");
 
     let args = Args::parse();
     info!("Loading configuration from: {:?}", args.config);
@@ -876,7 +877,9 @@ async fn async_main() -> Result<()> {
                     }
                     shutdown_token.cancel();
                     aggregator_for_shutdown.shutdown().await;
-                    return Ok(());
+                    // Hard-exit to avoid hanging on blocking stdin read in stdio transport.
+                    info!("Force-exiting process after Ctrl+C (stdio, early)");
+                    std::process::exit(130);
                 }
             };
 
@@ -891,12 +894,15 @@ async fn async_main() -> Result<()> {
                 let _ = server_done_rx.await;
             };
 
+            let mut got_sigint = false;
+
             tokio::select! {
                 ctrl = tokio::signal::ctrl_c() => {
                     match ctrl {
                         Ok(()) => info!("Ctrl+C received, shutting down aggregator service..."),
                         Err(err) => error!("Failed to listen for Ctrl+C: {}", err),
                     }
+                    got_sigint = true;
                 }
                 _ = server_done => {
                     info!("Stdio transport finished");
@@ -905,6 +911,11 @@ async fn async_main() -> Result<()> {
 
             shutdown_token.cancel();
             aggregator_for_shutdown.shutdown().await;
+            if got_sigint {
+                // Hard-exit to avoid hanging on blocking stdin read in stdio transport.
+                info!("Force-exiting process after Ctrl+C (stdio)");
+                std::process::exit(130);
+            }
 
             match server_handle.await {
                 Ok(Ok(reason)) => {
@@ -1041,5 +1052,6 @@ async fn async_main() -> Result<()> {
             ));
         }
     }
+    info!("async_main completed, returning Ok(())");
     Ok(())
 }
